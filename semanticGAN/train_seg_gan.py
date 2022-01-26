@@ -556,6 +556,9 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
                         'd_img': d_img_module.state_dict(),
                         'd_seg': d_seg_module.state_dict(),
                         'g_ema': g_ema.state_dict(),
+                        'g_optim': g_optim.state_dict(),
+                        'd_img_optim': d_img_optim.state_dict(),
+                        'd_seg_optim' : d_seg_optim.state_dict(),
                         'args': args,
                     },
                     os.path.join(ckpt_dir, f'ckpt/{str(i).zfill(6)}.pt'),
@@ -651,8 +654,8 @@ if __name__ == '__main__':
     parser.add_argument('--g_reg_every', type=int, default=4)
     parser.add_argument('--d_use_seg_every', type=int, help='frequency mixing seg image with real image', default=-1)
     parser.add_argument('--viz_every', type=int, default=100)
-    parser.add_argument('--eval_every', type=int, default=2000)
-    parser.add_argument('--save_every', type=int, default=2000)
+    parser.add_argument('--eval_every', type=int, default=500)
+    parser.add_argument('--save_every', type=int, default=500)
 
     parser.add_argument('--mixing', type=float, default=0.9)
     parser.add_argument('--lambda_dseg_feat', type=float, default=2.0)
@@ -716,7 +719,7 @@ if __name__ == '__main__':
     # build checkpoint dir
     from datetime import datetime
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-    ckpt_dir = os.path.join(args.checkpoint_dir, args.seg_name+'run-'+current_time)
+    ckpt_dir = os.path.join(args.checkpoint_dir, args.seg_name+'-run-'+current_time)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     writer = SummaryWriter(log_dir=os.path.join(ckpt_dir, 'logs'))
@@ -797,9 +800,9 @@ if __name__ == '__main__':
         discriminator_seg.load_state_dict(ckpt['d_seg'])
         g_ema.load_state_dict(ckpt['g_ema'])
 
-        g_optim.load_state_dict(ckpt['g_optim'])
-        d_img_optim.load_state_dict(ckpt['d_img_optim'])
-        d_seg_optim.load_state_dict(ckpt['d_seg_optim'])
+        # g_optim.load_state_dict(ckpt['g_optim'])
+        # d_img_optim.load_state_dict(ckpt['d_img_optim'])
+        # d_seg_optim.load_state_dict(ckpt['d_seg_optim'])
     
     if args.local_rank == 0:
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
@@ -880,7 +883,7 @@ if __name__ == '__main__':
         sampler=data_sampler(img_dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
         pin_memory=True,
-        num_workers=8,
+        num_workers=3,
         prefetch_factor=2,
     )
 
@@ -894,7 +897,7 @@ if __name__ == '__main__':
         sampler=data_sampler(seg_dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
         pin_memory=True,
-        num_workers=8,
+        num_workers=3,
         prefetch_factor=2,
     )
 
