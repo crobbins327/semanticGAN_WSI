@@ -30,6 +30,7 @@ sys.path.append('..')
 from typing import Sequence
 
 import numpy as np
+from tqdm import tqdm
 import torch
 from torch import nn, autograd, optim
 from torch.nn import functional as F
@@ -52,6 +53,7 @@ import functools
 from utils.inception_utils import sample_gema, prepare_inception_metrics
 import cv2
 import random
+import torch_utils.misc as misc
 
 def data_sampler(dataset, shuffle, distributed):
     if distributed:
@@ -108,9 +110,11 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
     noise = torch.randn_like(fake_img) / math.sqrt(
         fake_img.shape[2] * fake_img.shape[3]
     )
+    # print('calc grad...')
     grad, = autograd.grad(
         outputs=(fake_img * noise).sum(), inputs=latents, create_graph=True
     )
+    # print(grad)
     path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
 
     path_mean = mean_path_length + decay * (path_lengths.mean() - mean_path_length)
@@ -206,6 +210,10 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
     img_loader = sample_data(img_loader)
     seg_loader = sample_data(seg_loader)
     pbar = range(args.iter)
+    
+    if get_rank() == 0:
+        pbar = tqdm(pbar, initial=args.start_iter, dynamic_ncols=True, smoothing=0.01)
+
 
     mean_path_length = 0
 
@@ -249,6 +257,8 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
         seg_img, seg_mask = seg_img.to(device), seg_mask.to(device)
 
         # =============================== Step1: train the d_img ===================================
+        # if get_rank() == 0:
+        #     print('Train d_img...')
         requires_grad(generator, False)
         requires_grad(discriminator_img, True)
         requires_grad(discriminator_seg, False)
@@ -274,6 +284,8 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
         d_img_optim.step()
         
         # =============================== Step2: train the d_seg ===================================
+        # if get_rank() == 0:
+        #     print('Train d_seg...')
         requires_grad(generator, False)
         requires_grad(discriminator_img, False)
         requires_grad(discriminator_seg, True)
@@ -301,6 +313,7 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
         d_regularize = i % args.d_reg_every == 0
 
         if d_regularize:
+            discriminator_img.requires_grad = True
             real_img.requires_grad = True
             real_pred = discriminator_img(real_img)
             r1_img_loss = d_r1_loss(real_pred, real_img)
@@ -331,19 +344,24 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
         loss_dict['r1_seg'] = r1_seg_loss
 
         # =============================== Step3: train the generator ===================================
+        # if get_rank() == 0:
+        #     print('Train generator...')
         requires_grad(generator, True)
         requires_grad(discriminator_img, False)
         requires_grad(discriminator_seg, False)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
         fake_img, fake_seg = generator(noise)
+        # print('generating images...')
 
         fake_img_pred = discriminator_img(fake_img)
+        # print('img_pred...')
  
         # stop gradient from d_seg to g_img
         fake_seg_pred = discriminator_seg(prep_dseg_input(args, fake_img.detach(), fake_seg, is_real=False))
         real_seg_pred = discriminator_seg(prep_dseg_input(args, seg_img, seg_mask, is_real=True))
-
+        # print('seg_pred...')
+        
         # prepare output
         fake_seg_pred = prep_dseg_output(args, fake_seg_pred, use_feat=True)
         real_seg_pred = prep_dseg_output(args, real_seg_pred, use_feat=False)
@@ -362,7 +380,7 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
             for D_j in range(len(fake_seg_pred[D_i])-1):
                 g_seg_feat_loss += D_weights * feat_weights * \
                     F.l1_loss(fake_seg_pred[D_i][D_j], real_seg_pred[D_i][D_j].detach()) * args.lambda_dseg_feat
-
+        # print('calculate g_seg_feat_loss...')
         g_loss = g_img_loss + g_seg_adv_loss + g_seg_feat_loss
   
         loss_dict['g_img'] = g_img_loss
@@ -373,10 +391,12 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
         generator.zero_grad()
         g_loss.backward()
         g_optim.step()
+        # print('step g...')
 
         g_regularize = i % args.g_reg_every == 0
 
-        if g_regularize:
+        if g_regularize and args.path_regularize != 0:
+            # print('g_regularize...')
             path_batch_size = max(1, args.batch // args.path_batch_shrink)
             noise = mixing_noise(
                 path_batch_size, args.latent, args.mixing, device
@@ -386,20 +406,28 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
             )
+            # print('calc path loss...')
 
             generator.zero_grad()
             weighted_path_loss = args.path_regularize * args.g_reg_every * path_loss
+            # print('calc weighted path loss...')
 
             if args.path_batch_shrink:
                 weighted_path_loss += 0 * fake_img[0, 0, 0, 0]
+            
+            # print('path batch shrink...')
 
             weighted_path_loss.backward()
+            # print('done with g_reg backward...')
       
             g_optim.step()
+            # print('done with g_reg step...')
 
             mean_path_length_avg = (
                 reduce_sum(mean_path_length).item() / get_world_size()
             )
+            # print('done with g_regularize...')
+            
 
         loss_dict['path'] = path_loss
         loss_dict['path_length'] = path_lengths.mean()
@@ -415,6 +443,7 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
 
         g_seg_adv_loss_val = loss_reduced['g_seg_adv'].mean().item()
         g_seg_feat_loss_val = loss_reduced['g_seg_feat'].mean().item()
+        
         r1_img_val = loss_reduced['r1_img'].mean().item()
         r1_seg_val = loss_reduced['r1_seg'].mean().item()
         
@@ -442,10 +471,22 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
 
             writer.add_scalar('path/path_loss', path_loss_val, global_step=i)
             writer.add_scalar('path/path_length', path_length_val, global_step=i)
-
+            
+            writer.add_scalar('g/total_loss', g_loss_val, global_step=i)
             writer.add_scalar('g/img_loss', g_img_loss_val, global_step=i)
             writer.add_scalar('g/seg_adv_loss', g_seg_adv_loss_val, global_step=i)
             writer.add_scalar('g/seg_feat_loss', g_seg_feat_loss_val, global_step=i)
+            
+            writer.add_scalar('d/img_loss', d_img_loss_val, global_step=i)
+            writer.add_scalar('d/seg_loss', d_seg_loss_val, global_step=i)
+            
+            pbar.set_description(
+                (
+                    f"d_img: {d_img_loss_val:.4f}; d_seg: {d_seg_loss_val:.4f}; g_img: {g_img_loss_val:.4f}; g_seg_adv: {g_seg_adv_loss_val:.4f}; g_seg_feat: {g_seg_feat_loss_val:.4f}; "
+                    f"r1_img: {r1_img_val:.4f}; r1_seg: {r1_seg_val:.4f}; "
+                    f"path: {path_loss_val:.4f}; mean path: {path_length_val:.4f}; "
+                )
+            )
 
 
             if i % args.viz_every == 0:
@@ -666,6 +707,7 @@ if __name__ == '__main__':
         args.class_val = class_val
         args.color_map = color_map
         args.seg_dim = len(color_map)
+        args.size = 1024
     
     if args.seg_dim is None:
         raise Exception('You need to specify seg_dim!')
@@ -758,14 +800,23 @@ if __name__ == '__main__':
         g_optim.load_state_dict(ckpt['g_optim'])
         d_img_optim.load_state_dict(ckpt['d_img_optim'])
         d_seg_optim.load_state_dict(ckpt['d_seg_optim'])
-
+    
+    if args.local_rank == 0:
+        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        img, seg = misc.print_module_summary(generator, [noise])
+        misc.print_module_summary(discriminator_img, [img])
+        misc.print_module_summary(discriminator_seg, [prep_dseg_input(args, img.detach(), seg, is_real=False)])
+        # print(generator)
+        # print(discriminator_img)
+        # print(discriminator_seg)
+    
     if args.distributed:
         generator = nn.parallel.DistributedDataParallel(
             generator,
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
 
         discriminator_img = nn.parallel.DistributedDataParallel(
@@ -773,7 +824,7 @@ if __name__ == '__main__':
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
 
         discriminator_seg = nn.parallel.DistributedDataParallel(
@@ -781,7 +832,7 @@ if __name__ == '__main__':
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
 
 
@@ -828,6 +879,9 @@ if __name__ == '__main__':
         batch_size=args.batch,
         sampler=data_sampler(img_dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
+        pin_memory=True,
+        num_workers=8,
+        prefetch_factor=2,
     )
 
     seg_dataset = get_seg_dataset(args, phase='train')
@@ -839,6 +893,9 @@ if __name__ == '__main__':
         batch_size=args.batch,
         sampler=data_sampler(seg_dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
+        pin_memory=True,
+        num_workers=8,
+        prefetch_factor=2,
     )
 
     seg_val_dataset = get_seg_dataset(args, phase='val')
@@ -850,6 +907,9 @@ if __name__ == '__main__':
         batch_size=args.batch,
         shuffle=False,
         drop_last=True,
+        pin_memory=False,
+        num_workers=0,
+        prefetch_factor=2,
     )
 
     torch.backends.cudnn.benchmark = True
