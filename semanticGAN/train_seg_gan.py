@@ -27,6 +27,8 @@ import os
 import sys
 sys.path.append('..')
 
+from typing import Sequence
+
 import numpy as np
 import torch
 from torch import nn, autograd, optim
@@ -36,7 +38,7 @@ from torchvision import transforms, utils
 from torch.utils.tensorboard import SummaryWriter
 
 from models.stylegan2_seg import GeneratorSeg, Discriminator, MultiscaleDiscriminator, GANLoss
-from dataloader.dataset import CelebAMaskDataset
+from dataloader.dataset import CelebAMaskDataset, WSIMaskDataset
 
 from utils.distributed import (
     get_rank,
@@ -66,14 +68,13 @@ def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
-
+        
 def accumulate(model1, model2, decay=0.999):
     par1 = dict(model1.named_parameters())
     par2 = dict(model2.named_parameters())
 
     for k in par1.keys():
-        par1[k].data.mul_(decay).add_(1 - decay, par2[k].data)
-
+        par1[k].data.mul_(decay).add_(par2[k].data, alpha=1 - decay)
 
 def sample_data(loader):
     while True:
@@ -461,6 +462,13 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
                         for key in color_map:
                             sample_mask[sample_seg==key] = torch.tensor(color_map[key], dtype=torch.float)
                         sample_mask = sample_mask.permute(0,3,1,2)
+                    elif args.seg_name == 'KID-MP':
+                        sample_seg = torch.argmax(sample_seg, dim=1)
+                        color_map = seg_val_loader.dataset.color_map
+                        sample_mask = torch.zeros((sample_seg.shape[0], sample_seg.shape[1], sample_seg.shape[2], 3), dtype=torch.float)
+                        for key in color_map:
+                            sample_mask[sample_seg==key] = torch.tensor(color_map[key], dtype=torch.float)
+                        sample_mask = sample_mask.permute(0,3,1,2)
                     
                     else:
                         raise Exception('No such a dataloader!')
@@ -516,17 +524,61 @@ def get_seg_dataset(args, phase='train'):
     if args.seg_name == 'celeba-mask':
         seg_dataset = CelebAMaskDataset(args, args.seg_dataset, is_label=True, phase=phase,
                                             limit_size=args.limit_data, aug=args.seg_aug, resolution=args.size)
-   
+    elif args.seg_name == 'KID-MP':
+        wsi_dir = '/home/cjr66/project/KID-DeepLearning/KID-Images-pyramid'
+        coord_dir = '/home/cjr66/project/KID-DeepLearning/Patch_coords-1024/MP_KPMP_all-patches-stride256'
+        mask_dir = '/home/cjr66/project/KID-DeepLearning/Labeled_patches/MP_1024_stride256'
+        process_list = '/home/cjr66/project/KID-DeepLearning/proc_info/MP_only-KID_process_list.csv'
+        seg_dataset = WSIMaskDataset(args,
+                                     wsi_dir,                   # Path to WSI directory.
+                                     coord_dir,                 # Path to h5 coord database.
+                                     mask_dir,
+                                     class_val = args.class_val,
+                                     color_map = args.color_map,
+                                     process_list = process_list,       #Dataframe path of WSIs to process and their seg_levels/downsample levels that correspond to the coords
+                                     wsi_exten = ['.tif', '.svs'],
+                                     mask_exten = '.png',
+                                     max_coord_per_wsi = 'inf',
+                                     rescale_mpp = True,
+                                     desired_mpp = 0.2,
+                                     random_seed = 0,
+                                     load_mode = 'openslide',
+                                     make_all_pipelines = True,
+                                     unlabel_transform=None, 
+                                     latent_dir=None, 
+                                     is_label=True, 
+                                     phase=phase, 
+                                     aug=args.seg_aug, 
+                                     resolution=1024
+                                     )
     else:
         raise Exception('No such a dataloader!')
     
     return seg_dataset
 
+class SpecificRotateTransform:
+    def __init__(self, angles: Sequence[int]):
+        self.angles = angles
+
+    def __call__(self, x):
+        angle = random.choice(self.angles)
+        return transforms.functional.rotate(x, angle)
+    
 def get_transformation(args):
     if args.seg_name == 'celeba-mask':
         transform = transforms.Compose(
                     [
                         transforms.RandomHorizontalFlip(),
+                        transforms.ToTensor(),
+                        transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5), inplace=True)
+                    ]
+                )
+    elif args.seg_name == 'KID-MP':
+        transform = transforms.Compose(
+                    [
+                        transforms.RandomHorizontalFlip(),
+                        transforms.RandomVerticalFlip(),
+                        SpecificRotateTransform([0,90,180,270]),
                         transforms.ToTensor(),
                         transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5), inplace=True)
                     ]
@@ -542,11 +594,11 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--img_dataset', type=str, required=True)
-    parser.add_argument('--seg_dataset', type=str, required=True)
+    parser.add_argument('--img_dataset', type=str, required=False)
+    parser.add_argument('--seg_dataset', type=str, required=False)
     parser.add_argument('--inception', type=str, help='inception pkl', required=True)
 
-    parser.add_argument('--seg_name', type=str, help='segmentation dataloader name[celeba-mask]', default='celeba-mask')
+    parser.add_argument('--seg_name', type=str, help='segmentation dataloader name[celeba-mask, KID-MP]', default='KID-MP')
     parser.add_argument('--iter', type=int, default=800000)
     parser.add_argument('--batch', type=int, default=16)
     parser.add_argument('--n_sample', type=int, default=64)
@@ -558,7 +610,7 @@ if __name__ == '__main__':
     parser.add_argument('--g_reg_every', type=int, default=4)
     parser.add_argument('--d_use_seg_every', type=int, help='frequency mixing seg image with real image', default=-1)
     parser.add_argument('--viz_every', type=int, default=100)
-    parser.add_argument('--eval_every', type=int, default=1000)
+    parser.add_argument('--eval_every', type=int, default=2000)
     parser.add_argument('--save_every', type=int, default=2000)
 
     parser.add_argument('--mixing', type=float, default=0.9)
@@ -571,17 +623,58 @@ if __name__ == '__main__':
     parser.add_argument('--unlabel_limit_data', type=str, default=None, help='number of limited unlabel data point to use')
 
     parser.add_argument('--image_mode', type=str, default='RGB', help='Image mode RGB|L')
-    parser.add_argument('--seg_dim', type=int, default=8)
+    parser.add_argument('--seg_dim', type=int, default=None)
     parser.add_argument('--seg_aug', action='store_true', help='seg augmentation')
 
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoint/')
+    
+    parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
 
     args = parser.parse_args()
+    
+    if args.seg_name == 'KID-MP':
+        class_val = {
+             "Background": 0,
+             "Lymphocytes": 19,
+             "Neutrophils": 39,
+             "Macrophage": 58,
+             "PCT Nuclei": 78,
+             "DCT Nuclei": 98,
+             "Endothelial": 117,
+             "Fibroblast": 137,
+             "Mesangial": 156,
+             "Parietal cells": 176,
+             "Podocytes": 196,
+             "Mitosis": 215,
+             "Tubule Nuclei": 235
+         }
+        color_map = {
+             0: [0, 0, 0],
+             1: [0, 128, 0],
+             2: [0, 255, 0],
+             3: [255, 153,102],
+             4: [255, 0, 255],
+             5: [0, 0, 128],
+             6: [0, 128, 128],
+             7: [235, 206, 155],
+             8: [255, 255, 0],
+             9: [58, 208, 67],
+             10: [0, 255, 255],
+             11: [179, 26, 26],
+             12: [130, 91, 37]
+         }
+        args.class_val = class_val
+        args.color_map = color_map
+        args.seg_dim = len(color_map)
+    
+    if args.seg_dim is None:
+        raise Exception('You need to specify seg_dim!')
+        
 
     # build checkpoint dir
     from datetime import datetime
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-    ckpt_dir = os.path.join(args.checkpoint_dir, 'run-'+current_time)
+    ckpt_dir = os.path.join(args.checkpoint_dir, args.seg_name+'run-'+current_time)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     writer = SummaryWriter(log_dir=os.path.join(ckpt_dir, 'logs'))
@@ -696,6 +789,35 @@ if __name__ == '__main__':
         transform = get_transformation(args)
         img_dataset = CelebAMaskDataset(args, args.img_dataset, unlabel_transform=transform, unlabel_limit_size=args.unlabel_limit_data,
                                                 is_label=False, resolution=args.size)
+    elif args.seg_name =='KID-MP':
+        transform = get_transformation(args)
+        wsi_dir = '/home/cjr66/project/KID-DeepLearning/KID-Images-pyramid'
+        coord_dir = '/home/cjr66/project/KID-DeepLearning/Patch_coords-1024/MP_KPMP_all-patches-stride256'
+        mask_dir = '/home/cjr66/project/KID-DeepLearning/Labeled_patches/MP_1024_stride256'
+        process_list = '/home/cjr66/project/KID-DeepLearning/proc_info/MP_only-KID_process_list.csv'
+        img_dataset = WSIMaskDataset(args,
+                                     wsi_dir,                   # Path to WSI directory.
+                                     coord_dir,                 # Path to h5 coord database.
+                                     mask_dir,
+                                     class_val = args.class_val,
+                                     color_map = args.color_map,
+                                     process_list = process_list,       #Dataframe path of WSIs to process and their seg_levels/downsample levels that correspond to the coords
+                                     wsi_exten = ['.tif', '.svs'],
+                                     mask_exten = '.png',
+                                     max_coord_per_wsi = 'inf',
+                                     rescale_mpp = True,
+                                     desired_mpp = 0.2,
+                                     random_seed = 0,
+                                     load_mode = 'openslide',
+                                     make_all_pipelines = True,
+                                     unlabel_transform=transform, 
+                                     latent_dir=None, 
+                                     is_label=False, 
+                                     phase='train', 
+                                     aug=False, 
+                                     resolution=1024
+                                     )
+         
     else:
         raise Exception('No such a dataloader!')
 
