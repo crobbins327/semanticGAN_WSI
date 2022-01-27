@@ -82,7 +82,8 @@ def convert(network_pkl, output_file, init_res=1024):
     # state_semD = OrderedDict()
     torch.device('cpu')
     if init_res == 1024:
-        ckpt = torch.load('/home/cjr66/project/KID-DeepLearning/semanticGAN_results/KID-MPrun-Jan26_00-01-06/ckpt/000000.pt', map_location=torch.device('cpu'))
+        # ckpt = torch.load('/home/cjr66/project/KID-DeepLearning/semanticGAN_results/init13_KID-MP-run-Jan26_00-01-06/ckpt/000000.pt', map_location=torch.device('cpu'))
+        ckpt = torch.load('/home/cjr66/project/KID-DeepLearning/semanticGAN_results/init10_KID-MP-run-Jan26_18-21-35/ckpt/000000.pt', map_location=torch.device('cpu'))
     elif init_res == 512:
         pass
     elif init_res == 256:
@@ -178,8 +179,8 @@ def convert(network_pkl, output_file, init_res=1024):
 
 if __name__ == "__main__":
     network_pkl = '/home/cjr66/project/KID-DeepLearning/NV-StyleGANv2-ADA_results/00144-KID_1024-MP-NV-StyleGANv2-ADA-mirror-KIDgan-g_lr2.5e-05-d_lr3e-05-gamma10-ema20-batch64-resumecustom/network-snapshot-013075.pkl'
-    output_file = '/home/cjr66/project/KID-DeepLearning/semanticGAN_results/KID_1024-MP-semGAN-from-013075.pt'
+    output_file = '/home/cjr66/project/KID-DeepLearning/semanticGAN_results/KID_1024-MP-semGAN10cell-from-013075.pt'
     convert(network_pkl, output_file, init_res=1024)
     torch.device('cpu')
-    check = torch.load('/home/cjr66/project/KID-DeepLearning/semanticGAN_results/KID_1024-MP-semGAN-from-013075.pt', map_location=torch.device('cpu'))
+    check = torch.load('/home/cjr66/project/KID-DeepLearning/semanticGAN_results/KID_1024-MP-semGAN10cell-from-013075.pt', map_location=torch.device('cpu'))
     print(check.keys())

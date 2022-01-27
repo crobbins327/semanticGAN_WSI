@@ -55,6 +55,9 @@ import cv2
 import random
 import torch_utils.misc as misc
 
+from collections import OrderedDict
+
+
 def data_sampler(dataset, shuffle, distributed):
     if distributed:
         return data.distributed.DistributedSampler(dataset, shuffle=shuffle)
@@ -205,7 +208,7 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
                         truncation=1.0, mean_latent=None, batch_size=args.batch)
 
     # d_seg gan loss
-    seg_gan_loss = GANLoss(gan_mode='hinge', tensor=torch.cuda.FloatTensor)
+    seg_gan_loss = GANLoss(gan_mode='original', tensor=torch.cuda.FloatTensor)
 
     img_loader = sample_data(img_loader)
     seg_loader = sample_data(seg_loader)
@@ -537,6 +540,21 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
                 validate(args, discriminator_img, discriminator_seg, seg_val_loader, device, writer, i)
                 
             if i % args.save_every == 0:
+                print("==================Saving checkpoint==================")
+                os.makedirs(os.path.join(ckpt_dir, 'ckpt'), exist_ok=True)
+                torch.save(
+                    {
+                        'g': g_module.state_dict(),
+                        'd_img': d_img_module.state_dict(),
+                        'd_seg': d_seg_module.state_dict(),
+                        'g_ema': g_ema.state_dict(),
+                        # 'g_optim': g_optim.state_dict(),
+                        # 'd_img_optim': d_img_optim.state_dict(),
+                        # 'd_seg_optim' : d_seg_optim.state_dict(),
+                        'args': args,
+                    },
+                    os.path.join(ckpt_dir, f'ckpt/{str(i).zfill(6)}.pt'),
+                )
                 print("==================Start calculating FID==================")
                 IS_mean, IS_std, FID = get_inception_metrics(sample_fn, num_inception_images=10000, use_torch=False)
                 print("iteration {0:08d}: FID: {1:.4f}, IS_mean: {2:.4f}, IS_std: {3:.4f}".format(i, FID, IS_mean, IS_std))
@@ -548,21 +566,6 @@ def train(args, ckpt_dir, img_loader, seg_loader, seg_val_loader, generator, dis
 
                 writer.add_text('metrics/FID', 'FID is {0:.4f}'.format(FID), global_step=i)
                 
-                
-                os.makedirs(os.path.join(ckpt_dir, 'ckpt'), exist_ok=True)
-                torch.save(
-                    {
-                        'g': g_module.state_dict(),
-                        'd_img': d_img_module.state_dict(),
-                        'd_seg': d_seg_module.state_dict(),
-                        'g_ema': g_ema.state_dict(),
-                        'g_optim': g_optim.state_dict(),
-                        'd_img_optim': d_img_optim.state_dict(),
-                        'd_seg_optim' : d_seg_optim.state_dict(),
-                        'args': args,
-                    },
-                    os.path.join(ckpt_dir, f'ckpt/{str(i).zfill(6)}.pt'),
-                )
 
 def get_seg_dataset(args, phase='train'):
     if args.seg_name == 'celeba-mask':
@@ -660,7 +663,9 @@ if __name__ == '__main__':
     parser.add_argument('--mixing', type=float, default=0.9)
     parser.add_argument('--lambda_dseg_feat', type=float, default=2.0)
     parser.add_argument('--ckpt', type=str, default=None)
-    parser.add_argument('--lr', type=float, default=0.002)
+    parser.add_argument('--g_lr', type=float, default=0.002)
+    parser.add_argument('--di_lr', type=float, default=0.002)
+    parser.add_argument('--ds_lr', type=float, default=0.002)
     parser.add_argument('--channel_multiplier', type=int, default=2)
     
     parser.add_argument('--limit_data', type=str, default=None, help='number of limited label data point to use')
@@ -673,40 +678,76 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoint/')
     
     parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
+    parser.add_argument("--num_workers", type=int, default=4, help="number of workers for main data loders (per GPU)")
 
     args = parser.parse_args()
     
     if args.seg_name == 'KID-MP':
+        # class_val = OrderedDict([
+        #             ("Background", 0),
+        #             ("Lymphocytes", 19),
+        #             # ("Neutrophils", 39),
+        #             # ("Macrophage", 58),
+        #             ("PCT Nuclei", 78),
+        #             ("DCT Nuclei", 98),
+        #             ("Endothelial", 117),
+        #             ("Fibroblast", 137),
+        #             ("Mesangial", 156),
+        #             ("Parietal cells", 176),
+        #             ("Podocytes", 196),
+        #             # ("Mitosis", 215),
+        #             ("Tubule Nuclei", 235)
+        #             ])
         class_val = {
-             "Background": 0,
-             "Lymphocytes": 19,
-             "Neutrophils": 39,
-             "Macrophage": 58,
-             "PCT Nuclei": 78,
-             "DCT Nuclei": 98,
-             "Endothelial": 117,
-             "Fibroblast": 137,
-             "Mesangial": 156,
-             "Parietal cells": 176,
-             "Podocytes": 196,
-             "Mitosis": 215,
-             "Tubule Nuclei": 235
-         }
+                    "Background": 0,
+                    "Lymphocytes": 19,
+                    # "Neutrophils": 39,
+                    # "Macrophage": 58,
+                    "PCT Nuclei": 78,
+                    "DCT Nuclei": 98,
+                    "Endothelial": 117,
+                    "Fibroblast": 137,
+                    "Mesangial": 156,
+                    "Parietal cells": 176,
+                    "Podocytes": 196,
+                    # "Mitosis": 215,
+                    "Tubule Nuclei": 235
+                    }
+        print(list(class_val.keys()))
+        
+        # if get_rank() == 0:
+        #     print(class_val.keys())
+            
         color_map = {
-             0: [0, 0, 0],
-             1: [0, 128, 0],
-             2: [0, 255, 0],
-             3: [255, 153,102],
-             4: [255, 0, 255],
-             5: [0, 0, 128],
-             6: [0, 128, 128],
-             7: [235, 206, 155],
-             8: [255, 255, 0],
-             9: [58, 208, 67],
-             10: [0, 255, 255],
-             11: [179, 26, 26],
-             12: [130, 91, 37]
-         }
+              0: [0, 0, 0],
+              # 1: [0, 128, 0],
+              1: [0, 255, 0],
+              # 3: [255, 153,102],
+              2: [255, 0, 255],
+              3: [0, 0, 128],
+              4: [0, 128, 128],
+              5: [235, 206, 155],
+              6: [255, 255, 0],
+              7: [58, 208, 67],
+              8: [0, 255, 255],
+              # 9: [179, 26, 26],
+              9: [130, 91, 37]
+          }
+        # color_map = {
+        #      0: [0, 0, 0],
+        #      1: [0, 128, 0],
+        #      2: [0, 255, 0],
+        #      3: [255, 153,102],
+        #      4: [255, 0, 255],
+        #      5: [0, 0, 128],
+        #      6: [0, 128, 128],
+        #      7: [235, 206, 155],
+        #      8: [255, 255, 0],
+        #      9: [58, 208, 67],
+        #      10: [0, 255, 255],
+        #      11: [179, 26, 26],
+        #      12: [130, 91, 37]
+        #  }
         args.class_val = class_val
         args.color_map = color_map
         args.seg_dim = len(color_map)
@@ -769,17 +810,17 @@ if __name__ == '__main__':
 
     g_optim = optim.Adam(
         generator.parameters(),
-        lr=args.lr * g_reg_ratio,
+        lr=args.g_lr * g_reg_ratio,
         betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio),
     )
     d_img_optim = optim.Adam(
         discriminator_img.parameters(),
-        lr=args.lr * d_reg_ratio,
+        lr=args.di_lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
     d_seg_optim = optim.Adam(
         discriminator_seg.parameters(),
-        lr=args.lr * d_reg_ratio,
+        lr=args.ds_lr * d_reg_ratio,
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
 
@@ -799,6 +840,7 @@ if __name__ == '__main__':
         discriminator_img.load_state_dict(ckpt['d_img'])
         discriminator_seg.load_state_dict(ckpt['d_seg'])
         g_ema.load_state_dict(ckpt['g_ema'])
+        del ckpt
 
         # g_optim.load_state_dict(ckpt['g_optim'])
         # d_img_optim.load_state_dict(ckpt['d_img_optim'])
@@ -883,7 +925,7 @@ if __name__ == '__main__':
         sampler=data_sampler(img_dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
         pin_memory=True,
-        num_workers=3,
+        num_workers=args.num_workers,
         prefetch_factor=2,
     )
 
@@ -896,8 +938,8 @@ if __name__ == '__main__':
         batch_size=args.batch,
         sampler=data_sampler(seg_dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
-        pin_memory=True,
-        num_workers=3,
+        pin_memory=False,
+        num_workers=args.num_workers,
         prefetch_factor=2,
     )
 
